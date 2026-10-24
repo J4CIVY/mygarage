@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -59,6 +60,43 @@ export default function Supplies() {
   const { data: quickVehicles = [] } = useQuickEntryVehicles()
 
   const supplies = useMemo(() => data?.supplies ?? [], [data?.supplies])
+
+  // `?supply=<id>` (from a service's Supplies used) opens that supply's history.
+  // An archived supply isn't in the default list, so widen it once before giving up.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const supplyParam = searchParams.get('supply')
+  const handledLinkRef = useRef<string | null>(null)
+  const widenedForLinkRef = useRef(false)
+  useEffect(() => {
+    // The param is dropped once handled, so its absence re-arms the next link
+    // to the same supply while this page stays mounted.
+    if (supplyParam == null) {
+      handledLinkRef.current = null
+      return
+    }
+    if (handledLinkRef.current === supplyParam || isLoading || !data) return
+    const linkedId = Number(supplyParam)
+    const validId = Number.isInteger(linkedId) && linkedId > 0
+    const linked = validId ? supplies.find((s) => s.id === linkedId) : undefined
+    if (!linked && validId && !includeArchived) {
+      widenedForLinkRef.current = true
+      setIncludeArchived(true)
+      return
+    }
+    handledLinkRef.current = supplyParam
+    if (linked) setHistoryTarget({ supply: linked })
+    // A dead link shouldn't leave archived supplies switched on behind it.
+    else if (widenedForLinkRef.current) setIncludeArchived(false)
+    widenedForLinkRef.current = false
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        next.delete('supply')
+        return next
+      },
+      { replace: true },
+    )
+  }, [supplyParam, isLoading, data, supplies, includeArchived, setSearchParams])
 
   const vehicleLabelFor = (vin: string): string => {
     const known = quickVehicles.find((v) => v.vin === vin)
