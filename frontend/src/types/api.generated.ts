@@ -2329,6 +2329,8 @@ export interface paths {
          *
          *     **Security:**
          *     - Owner of the device's linked vehicle (admin for unlinked devices).
+         *     - A preset sensor is admin-only: deleting it drops its topic maps and its
+         *       readings on every vehicle it ever reported to, not just this one.
          */
         delete: operations["delete_device_api_livelink_devices__device_id__delete"];
         options?: never;
@@ -2351,7 +2353,9 @@ export interface paths {
          *
          *     409 while LiveLink is switched off: the service would quietly do nothing
          *     (it checks the master switch too, for queued backfills), and an operator
-         *     who pressed "pull now" deserves to be told why nothing arrived.
+         *     who pressed "pull now" deserves to be told why nothing arrived. 422 for a
+         *     kind with no SD card (only WiCAN has one), for the same reason, and 404
+         *     for no such device.
          *
          *     **Security:**
          *     - Requires admin authentication
@@ -2385,7 +2389,7 @@ export interface paths {
          *
          *     **Security:**
          *     - Owner of the device's linked vehicle (admin for unlinked devices).
-         *     - Device must be online
+         *     - Device must take commands (a WiCAN) and be online
          *     - MQTT subscriber must be connected
          */
         post: operations["send_device_command_api_livelink_devices__device_id__command_post"];
@@ -2508,6 +2512,8 @@ export interface paths {
         /**
          * Set Sd Config
          * @description Configure the SD-pull address and enable flag for a device.
+         *
+         *     404 for no such device, 422 for a kind with no SD card (only WiCAN has one).
          *
          *     **Security:**
          *     - Requires admin authentication
@@ -2749,9 +2755,12 @@ export interface paths {
         get: operations["get_mqtt_settings_api_livelink_mqtt_settings_get"];
         /**
          * Update Mqtt Settings
-         * @description Update MQTT subscriber settings.
+         * @description Update MQTT subscriber settings, and apply them.
          *
-         *     After updating settings, restart the MQTT subscriber for changes to take effect.
+         *     Switching `enabled` off stops the subscriber and switching it on starts
+         *     it. Changing any other field restarts a running subscriber, as the Restart
+         *     button does; a stopped one stays stopped. Sending a field's stored value
+         *     isn't a change.
          *
          *     **Security:**
          *     - Requires authentication
@@ -2902,9 +2911,9 @@ export interface paths {
          *     `topics` is checked against it here rather than on the schema.
          *
          *     Each reading's parameter gets the preset's `storage_interval_seconds`.
-         *     REQUIRED, not tuning: retained messages replay on every resubscribe and
-         *     the storage path stamps server time, so without it each reconnect writes a
-         *     fresh row.
+         *     REQUIRED, not tuning: the gateway republishes every few seconds and the
+         *     storage path stamps server time, so without it a sensor writes a row per
+         *     message.
          */
         post: operations["apply_preset_api_livelink_presets__name__apply_post"];
         delete?: never;
@@ -3000,6 +3009,10 @@ export interface paths {
         /**
          * Discover Topics
          * @description Listen briefly and report what the broker is publishing.
+         *
+         *     409 when a run is already going or MQTT can't connect as configured (off,
+         *     no broker host), 502 with the broker's message when it refuses or can't be
+         *     reached.
          */
         post: operations["discover_topics_api_livelink_topic_discovery_post"];
         delete?: never;
@@ -4202,11 +4215,14 @@ export interface paths {
          * @description Receive telemetry data from WiCAN OBD2 devices.
          *
          *     This endpoint is called by WiCAN PRO devices configured for HTTPS POST.
-         *     Authentication is via Bearer token (global or per-device).
+         *     Authentication is via Bearer token (global or per-device). The payload is
+         *     processed before the response is sent, through the same pipeline as MQTT.
          *
          *     WiCAN sends two types of payloads:
-         *     - Status payloads (with device_id) - used for discovery and status updates
-         *     - Telemetry-only payloads (just autopid_data) - for high-frequency data
+         *     - Status payloads (with device_id): sent with `config` on the first POST after
+         *       a cold boot, and used for discovery and status updates
+         *     - Telemetry-only payloads (just autopid_data): every cycle; the device is
+         *       found by its token
          *
          *     **Headers:**
          *     - **Authorization**: Bearer token (required)
@@ -4214,11 +4230,11 @@ export interface paths {
          *     **Request Body:**
          *     WiCAN payload containing:
          *     - **autopid_data**: Dictionary of parameter names to values (decoded OBD2 data)
-         *     - **config**: Dictionary of parameter metadata (units, classes) - optional
-         *     - **status**: Device status information - optional (sent periodically)
+         *     - **config**: Dictionary of parameter metadata (units, classes); kept per device
+         *     - **status**: Device status information - optional
          *
          *     **Returns:**
-         *     - 202 Accepted: Payload queued for processing
+         *     - 202 Accepted: Payload processed (a `processing_error` key says it failed)
          *     - 401 Unauthorized: Invalid or missing token
          *     - 422 Unprocessable Entity: Invalid payload format
          */
@@ -10002,7 +10018,7 @@ export interface components {
             device_id: string;
             /**
              * Online
-             * @description Whether the device is reporting now: the integrations card's own rule, so a device with no status topic counts as online while it has reported within the offline timeout.
+             * @description Whether the device is reporting now, by the integrations card's rule: a device whose device_status is 'online' counts as online until the offline sweep flips it, one that never reports a status (Torque) keeps 'unknown' and counts as online while it has reported within the offline timeout, and a disabled device is never online.
              * @default false
              */
             online: boolean;
@@ -12465,7 +12481,7 @@ export interface components {
             devices: components["schemas"]["LiveLinkDeviceResponse"][];
             /**
              * Online Count
-             * @description Number of devices currently online
+             * @description Number of devices currently online, by each device's `online`
              * @default 0
              */
             online_count: number;
@@ -12491,7 +12507,10 @@ export interface components {
             device_id: string;
             /** Kind */
             kind: string;
-            /** Label */
+            /**
+             * Label
+             * @description User-friendly device name, stored stripped. Blank is no name.
+             */
             label?: string | null;
             /** Vin */
             vin?: string | null;
@@ -12585,6 +12604,12 @@ export interface components {
              * @description Declared odometer units ('km'/'mi'); None means inferred from the key
              */
             odometer_unit?: string | null;
+            /**
+             * Online
+             * @description Whether the device is reporting now, by the integrations card's rule: a device whose device_status is 'online' counts as online until the offline sweep flips it, one that never reports a status (Torque) keeps 'unknown' and counts as online while it has reported within the offline timeout, and a disabled device is never online. Read this, not device_status.
+             * @default false
+             */
+            online: boolean;
             /**
              * Preset Key
              * @description The preset that created this device, if any. A preset device's tab is named by its preset, and its mappings are the preset's, not hand-made.
@@ -12725,7 +12750,7 @@ export interface components {
             category?: string | null;
             /**
              * Critical Min
-             * @description Urgent alert if value drops below; must sit under warning_min
+             * @description Urgent alert if value drops below; must sit under warning_min. In the reading's canonical metric unit (°C, km/h, kPa, km); a raw-unit reading in its own unit
              */
             critical_min?: number | null;
             /**
@@ -12755,12 +12780,12 @@ export interface components {
             storage_interval_seconds?: number | null;
             /**
              * Warning Max
-             * @description Alert if value exceeds
+             * @description Alert if value exceeds, in the reading's canonical metric unit (°C, km/h, kPa, km); a raw-unit reading in its own unit
              */
             warning_max?: number | null;
             /**
              * Warning Min
-             * @description Alert if value drops below
+             * @description Alert if value drops below, in the reading's canonical metric unit (°C, km/h, kPa, km); a raw-unit reading in its own unit
              */
             warning_min?: number | null;
         };
@@ -19284,7 +19309,7 @@ export interface components {
             device_id?: string | null;
             /**
              * Device Status
-             * @description Device: online/offline
+             * @description 'online' when `online` is true, else 'offline'
              * @default offline
              * @enum {string}
              */
@@ -19298,7 +19323,7 @@ export interface components {
             ecu_status: "online" | "offline" | "unknown";
             /**
              * Kind
-             * @description Source kind of the reporting device
+             * @description Source kind of the device this status describes: the most recently seen one that drives sessions, else the most recently seen of any kind. device_id, ecu_status, rssi, battery_voltage and the session fields come from the same device.
              */
             kind?: string | null;
             /**
@@ -19313,7 +19338,7 @@ export interface components {
             latest_values?: components["schemas"]["TelemetryLatestValue"][];
             /**
              * Online
-             * @description Whether the reporting device is reporting now, by the integrations card's rule: a source with no status topic (a Mopeka sensor) keeps device_status 'unknown' and counts as online while it has reported within the offline timeout. Read this, not device_status.
+             * @description Whether any device linked to this vehicle is reporting now, each by the integrations card's rule: a device whose device_status is 'online' counts as online until the offline sweep flips it, one that never reports a status (Torque) keeps 'unknown' and counts as online while it has reported within the offline timeout, and a disabled device is never online.
              * @default false
              */
             online: boolean;
@@ -20571,7 +20596,8 @@ export interface components {
          * @description Schema for complete WiCAN HTTPS POST payload.
          *
          *     WiCAN devices send two types of payloads:
-         *     1. Status payloads (include device info) - sent periodically
+         *     1. Status payloads (include device info), with `config` on the first POST
+         *        after a cold boot (upstream v1.2 sends `status` + `config` once per boot)
          *     2. Telemetry-only payloads (just autopid_data) - sent every cycle
          *
          *     Example with status:
@@ -20600,7 +20626,7 @@ export interface components {
             config?: {
                 [key: string]: components["schemas"]["WiCANConfigEntry"];
             };
-            /** @description Device status (optional, sent periodically) */
+            /** @description Device status (optional; sent with config once per cold boot) */
             status?: components["schemas"]["WiCANStatus"] | null;
             /**
              * Timestamp

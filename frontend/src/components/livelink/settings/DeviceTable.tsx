@@ -15,7 +15,7 @@ import type {
 } from '@/types/livelink'
 import type { SourceInfo } from '@/types/livelinkTopicMap'
 import type { Vehicle } from '@/types/vehicle'
-import { getErrorMessage } from '@/utils/httpErrorHandler'
+import { getActionErrorMessage } from '@/utils/httpErrorHandler'
 import DeviceRow from './DeviceRow'
 
 /**
@@ -74,17 +74,21 @@ export default function DeviceTable({
     }
   }
 
-  const handleUpdateDevice = async (deviceId: string, update: LiveLinkDeviceUpdate): Promise<void> => {
+  /** False when the server refused it, so the row can put its value back. */
+  const handleUpdateDevice = async (deviceId: string, update: LiveLinkDeviceUpdate): Promise<boolean> => {
     try {
       await livelinkService.updateDevice(deviceId, update)
       toast.success(t('modal.deviceUpdated'))
       onChanged()
+      return true
     } catch (error) {
       console.error('Failed to update device:', error)
-      // The server refuses an odometer-unit change once readings depend on it,
-      // and says why and what to run. A generic failure toast would throw that
-      // away and leave the setting looking merely broken.
-      toast.error(getErrorMessage(error, t('modal.failedToUpdateDevice')))
+      // The server says why it refused: a 409 once readings depend on the
+      // odometer unit, a 403 for an unlinked device a non-admin can't manage.
+      // A generic toast would throw that away and leave the setting looking
+      // merely broken.
+      toast.error(getActionErrorMessage(error, t('modal.livelink.updateDeviceAction')))
+      return false
     }
   }
 
@@ -166,7 +170,8 @@ export default function DeviceTable({
       onChanged()
     } catch (error) {
       console.error('Failed to save SD config:', error)
-      toast.error(t('modal.livelink.failedToSaveSdConfig'))
+      // A kind with no SD card is a 422 that says so.
+      toast.error(getActionErrorMessage(error, t('modal.livelink.saveSdConfigAction')))
     }
   }
 
@@ -185,7 +190,8 @@ export default function DeviceTable({
       return result
     } catch (error) {
       console.error('Failed to trigger SD backfill:', error)
-      toast.error(t('modal.livelink.sdBackfillFailed'))
+      // 422 for a kind with no SD card, 409 with LiveLink off: both say why.
+      toast.error(getActionErrorMessage(error, t('modal.livelink.sdBackfillAction')))
       return null
     }
   }
@@ -215,7 +221,7 @@ export default function DeviceTable({
                 showFirmware={showFirmware}
                 deviceFirmware={deviceFirmware.find((d) => d.device_id === device.device_id)}
                 mqttConnected={mqttConnected}
-                onUpdate={(id, update) => void handleUpdateDevice(id, update)}
+                onUpdate={handleUpdateDevice}
                 onDelete={(id) => void handleDeleteDevice(id)}
                 onGenerateToken={(id) => void handleGenerateDeviceToken(id)}
                 onRevokeToken={(id) => void handleRevokeDeviceToken(id)}

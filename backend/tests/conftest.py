@@ -20,7 +20,7 @@ os.environ.setdefault("MYGARAGE_SETTINGS_KEY", "bXlnYXJhZ2UgdGVzdCBzZXR0aW5ncyBr
 if "TEST_DATABASE_URL" in os.environ:
     os.environ["MYGARAGE_DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from typing import NoReturn
 
 import pytest
@@ -111,6 +111,56 @@ async def init_test_db(test_engine):
     # Cleanup after tests
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest.fixture(autouse=True)
+def _no_session_refresh_debounce() -> Generator[None]:
+    """Run a closed session's queued refresh as soon as its commit lands.
+
+    With the real debounce every test that commits a reading inside a closed
+    window would park in the drain below for 2 to 30 s (B6-12, E-7). A test
+    that measures the debounce sets the real values itself.
+    """
+    from app.services import telemetry_service
+
+    saved = (
+        telemetry_service.SESSION_REFRESH_DEBOUNCE_SECONDS,
+        telemetry_service.SESSION_REFRESH_MAX_DELAY_SECONDS,
+    )
+    telemetry_service.SESSION_REFRESH_DEBOUNCE_SECONDS = 0.0
+    telemetry_service.SESSION_REFRESH_MAX_DELAY_SECONDS = 0.0
+    telemetry_service._REFRESH_DUE.clear()
+    yield
+    (
+        telemetry_service.SESSION_REFRESH_DEBOUNCE_SECONDS,
+        telemetry_service.SESSION_REFRESH_MAX_DELAY_SECONDS,
+    ) = saved
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _finish_post_commit_jobs(_no_session_refresh_debounce: None) -> AsyncGenerator[None]:
+    """Let the background jobs a test's commits queued finish before the next test.
+
+    They run on the test loop, so one still running would send its
+    notification into the next test's recorder (`app.services.post_commit`).
+    Torn down before the debounce fixture, so the drain runs on its values.
+    """
+    yield
+    from app.services.post_commit import drain
+
+    await drain()
+
+
+@pytest.fixture(autouse=True)
+def _forget_rate_baselines() -> None:
+    """Start every test with no remembered readings, as a fresh process would.
+
+    The rate check keeps each device's last accepted reading in memory, and
+    the suite reuses device ids and keys across tests.
+    """
+    from app.services.telemetry_validator import forget_accepted_readings
+
+    forget_accepted_readings()
 
 
 @pytest_asyncio.fixture
