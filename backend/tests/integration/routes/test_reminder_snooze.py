@@ -249,6 +249,7 @@ class TestSnoozeSuppression:
 
             async def dispatch(self, event_type, title, message):
                 sent.append(title)
+                return {"ntfy": True}
 
         monkeypatch.setattr(
             "app.services.notifications.dispatcher.NotificationDispatcher",
@@ -291,3 +292,7 @@ class TestSnoozeSuppression:
         assert r.status_code == 200, r.text
         titles = [e["title"] for e in r.json()["events"]]
         assert any("Snooze calendar" in t for t in titles), titles
+        event = next(e for e in r.json()["events"] if "Snooze calendar" in e["title"])
+        # Still on its due date, and labelled snoozed rather than due soon.
+        assert event["status"] == "snoozed"
+        assert event["urgency"] == "low"

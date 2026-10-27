@@ -46,6 +46,7 @@ from app.utils.household_time import (
     load_household_zone,
 )
 from app.utils.logging_utils import sanitize_for_log
+from app.utils.notification_cooldown import in_cooldown
 from app.utils.render_context import render_context_for_vehicle, render_context_for_vehicle_row
 from app.utils.unit_adapters import adapter_for
 from app.utils.usage_tracking import tracks_distance
@@ -53,9 +54,6 @@ from app.utils.usage_tracking import tracks_distance
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
-
-# Notification dedup cooldown (24 hours)
-NOTIFICATION_COOLDOWN = timedelta(hours=24)
 
 
 async def _get_setting(db: AsyncSession, key: str, default: str = "") -> str:
@@ -67,7 +65,7 @@ async def _get_setting(db: AsyncSession, key: str, default: str = "") -> str:
 async def reset_daily_limits() -> None:
     """Reset daily API limits for providers (TomTom, Yelp).
 
-    Runs daily at midnight UTC.
+    Runs daily at midnight.
     """
     async with AsyncSessionLocal() as db:
         await load_household_zone(db)
@@ -82,7 +80,7 @@ async def reset_daily_limits() -> None:
 async def reset_monthly_limits() -> None:
     """Reset monthly API limits for providers (Google Places, Foursquare).
 
-    Runs on the 1st of each month at midnight UTC.
+    Runs on the 1st of each month at midnight.
     """
     async with AsyncSessionLocal() as db:
         await load_household_zone(db)
@@ -97,8 +95,8 @@ async def reset_monthly_limits() -> None:
 async def check_expiring_documents() -> None:
     """Check for expiring insurance and warranties and send notifications.
 
-    Runs daily at 9 AM UTC. Reads notify_insurance_days and notify_warranty_days
-    settings. Uses 24-hour cooldown to prevent duplicate notifications.
+    Runs daily at 9 AM. Reads notify_insurance_days and notify_warranty_days
+    settings. `in_cooldown` keeps it to one notification a day.
     """
     async with AsyncSessionLocal() as db:
         await load_household_zone(db)
@@ -143,10 +141,7 @@ async def check_expiring_documents() -> None:
             for policy in insurance_result.scalars().unique().all():
                 if policy.id in renewed:
                     continue
-                if (
-                    policy.last_notified_at
-                    and (now - policy.last_notified_at) < NOTIFICATION_COOLDOWN
-                ):
+                if in_cooldown(policy.last_notified_at, now):
                     continue
 
                 covered = [vehicles_dict.get(link.vin) for link in policy.vehicle_links]
@@ -182,10 +177,7 @@ async def check_expiring_documents() -> None:
             )
             for warranty in warranty_result.scalars().all():
                 # Dedup check
-                if (
-                    warranty.last_notified_at
-                    and (now - warranty.last_notified_at) < NOTIFICATION_COOLDOWN
-                ):
+                if in_cooldown(warranty.last_notified_at, now):
                     continue
 
                 if not warranty.end_date:
@@ -217,7 +209,7 @@ async def check_expiring_documents() -> None:
 async def check_odometer_milestones() -> None:
     """Check for odometer milestones and send notifications.
 
-    Runs daily at 10 AM UTC. Skips a vehicle with no odometer (#217). Checks
+    Runs daily at 10 AM. Skips a vehicle with no odometer (#217). Checks
     each vehicle's latest odometer_km against milestone boundaries: every
     10,000 of the distance unit the vehicle renders in (its own odometer unit,
     else its owner's, else the instance default; #172). Uses
@@ -340,7 +332,7 @@ async def _get_def_low_threshold_percent(db: AsyncSession) -> int:
 async def check_def_levels() -> None:
     """Check DEF (Diesel Exhaust Fluid) levels and send low-level notifications.
 
-    Runs daily at 11 AM UTC. For each non-archived, diesel-capable vehicle
+    Runs daily at 11 AM. For each non-archived, diesel-capable vehicle
     with a configured DEF tank capacity, reads the latest fill_level (a 0-1
     fraction) and compares it against notify_def_low_threshold_percent.
 
@@ -761,21 +753,21 @@ def start_scheduler() -> None:
 
     Only starts if SCHEDULER_ENABLED=true (explicit opt-in, fail-closed).
 
-    Schedules:
-        - Daily reset at midnight UTC for daily-limited providers
-        - Monthly reset on 1st at midnight UTC for monthly-limited providers
-        - Maintenance notification check at 8 AM UTC (brake reminders raised first)
-        - Document expiration check at 9 AM UTC
-        - Odometer milestone check at 10 AM UTC
-        - DEF level check at 11 AM UTC
+    Schedules (container local time; only the recall check is pinned to UTC):
+        - Daily reset at midnight for daily-limited providers
+        - Monthly reset on 1st at midnight for monthly-limited providers
+        - Maintenance notification check at 8 AM (brake reminders raised first)
+        - Document expiration check at 9 AM
+        - Odometer milestone check at 10 AM
+        - DEF level check at 11 AM
         - NHTSA recall check daily at 2 AM UTC, when its interval is due
         - LiveLink: Session timeout check every minute
         - LiveLink: Device offline check every 5 minutes
         - LiveLink: Pending offline finalization every 15 seconds
-        - LiveLink: Daily summary generation at 1 AM UTC
-        - LiveLink: Firmware check at 3 AM UTC
-        - LiveLink: Telemetry pruning at 4 AM UTC
-        - Auto-archive inactive vehicles at 5 AM UTC
+        - LiveLink: Daily summary generation at 1 AM
+        - LiveLink: Firmware check at 3 AM
+        - LiveLink: Telemetry pruning at 4 AM
+        - Auto-archive inactive vehicles at 5 AM
     """
     if os.environ.get("SCHEDULER_ENABLED", "").lower() != "true":
         logger.warning(
@@ -786,7 +778,7 @@ def start_scheduler() -> None:
 
     logger.info("Scheduler enabled — starting background jobs.")
 
-    # Daily reset at midnight UTC
+    # Daily reset at midnight
     scheduler.add_job(
         reset_daily_limits,
         "cron",
@@ -796,7 +788,7 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
-    # Monthly reset on 1st at midnight UTC
+    # Monthly reset on 1st at midnight
     scheduler.add_job(
         reset_monthly_limits,
         "cron",
@@ -807,7 +799,7 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
-    # Reminder notification check at 8:00 AM UTC
+    # Reminder notification check at 8:00 AM
     scheduler.add_job(
         check_reminder_notifications,
         "cron",
@@ -817,7 +809,7 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
-    # Document expiration check at 9 AM UTC
+    # Document expiration check at 9 AM
     scheduler.add_job(
         check_expiring_documents,
         "cron",
@@ -827,7 +819,7 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
-    # Odometer milestone check at 10 AM UTC
+    # Odometer milestone check at 10 AM
     scheduler.add_job(
         check_odometer_milestones,
         "cron",
@@ -837,7 +829,7 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
-    # DEF level check at 11 AM UTC
+    # DEF level check at 11 AM
     scheduler.add_job(
         check_def_levels,
         "cron",
@@ -849,8 +841,8 @@ def start_scheduler() -> None:
 
     # NHTSA recall check daily at 2 AM UTC; the job itself decides whether
     # nhtsa_recall_check_interval is due. The only job pinned to UTC: the
-    # scheduler has no timezone, so the other jobs' "UTC" is really the
-    # container's local zone. The due check's hour of slack assumes 24 hours
+    # scheduler has no timezone, so the other jobs run on the container's
+    # local zone. The due check's hour of slack assumes 24 hours
     # between ticks, and a local-zone cron puts 23 or 25 between them on DST days.
     scheduler.add_job(
         check_recalls_all_vehicles,
@@ -909,7 +901,7 @@ def start_scheduler() -> None:
         replace_existing=True,
     )
 
-    # Auto-archive inactive vehicles at 5 AM UTC (no-op when setting is 0)
+    # Auto-archive inactive vehicles at 5 AM (no-op when setting is 0)
     scheduler.add_job(
         auto_archive_inactive_vehicles,
         "cron",

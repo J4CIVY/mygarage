@@ -14,7 +14,8 @@ existed. Every other backward-compat assertion (mileage/date/both unaffected)
 lives alongside it in ``TestValidateReminderStateBackwardCompat``.
 """
 
-from collections.abc import Iterator
+import uuid
+from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -23,12 +24,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete
+from httpx import AsyncClient
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.constants.units import METRIC_PRESET
 from app.models import HoursRecord, OdometerRecord, Reminder
 from app.models.user import User
+from app.models.vehicle import Vehicle
 from app.schemas.reminder import ReminderResponse
 from app.services import reminder_service
 from app.services.reminder_service import (
@@ -36,9 +39,9 @@ from app.services.reminder_service import (
     DueContext,
     ReminderStart,
     _build_reminder_message,
+    _due_event,  # pyright: ignore[reportPrivateUsage]
     anchor_start,
     calculate_hours_driving_rate,
-    calculate_smart_estimated_date,
     check_due_reminders,
     classify_pending_reminders,
     count_pending_reminders,
@@ -426,23 +429,6 @@ class TestExpectedDueDate:
 
     def test_nothing_to_go_on_is_none(self):
         assert expected_due_date(_pending(), None, None, None, None, TODAY) is None
-
-
-@pytest.mark.unit
-class TestCalculateSmartEstimatedDate:
-    """The scheduler's smart estimate, capped at the reminder's hard date."""
-
-    def test_a_rate_too_slow_to_project_is_the_hard_date(self):
-        """5,000 km at 0.0001 km/day is past 9999-12-31; the cap is the answer."""
-        assert calculate_smart_estimated_date(
-            Decimal("0"), Decimal("5000"), 0.0001, date(2027, 1, 1)
-        ) == date(2027, 1, 1)
-
-    def test_a_nan_rate_is_the_hard_date(self):
-        # Pins the isfinite half of the guard: NaN slips past the day bound.
-        assert calculate_smart_estimated_date(
-            Decimal("0"), Decimal("1"), float("nan"), date(2027, 1, 1)
-        ) == date(2027, 1, 1)
 
 
 @pytest.mark.unit
@@ -1309,7 +1295,7 @@ class TestEnrichWithEstimateSmartProjection:
     ):
         """New capability: due_date + due_hours (mileage null) projects a
         due-date from the engine-hours-per-day rate, mirroring the mileage
-        case above via the same calculate_smart_estimated_date formula."""
+        case above."""
         vin = test_vehicle["vin"]
 
         # Known rate: 200 hours over 20 days = 10 hr/day.
@@ -1499,6 +1485,7 @@ class TestCheckDueRemindersHours:
 
             async def dispatch(self, event_type, title, message):
                 sent_messages.append(message)
+                return {"ntfy": True}
 
         monkeypatch.setattr(
             "app.services.notifications.dispatcher.NotificationDispatcher",
@@ -1547,6 +1534,7 @@ class TestCheckDueRemindersHours:
 
             async def dispatch(self, event_type, title, message):
                 sent_messages.append(message)
+                return {"ntfy": True}
 
         monkeypatch.setattr(
             "app.services.notifications.dispatcher.NotificationDispatcher",
@@ -1606,6 +1594,7 @@ class TestCheckDueRemindersHours:
 
             async def dispatch(self, event_type, title, message):
                 sent_messages.append(message)
+                return {"ntfy": True}
 
         monkeypatch.setattr(
             "app.services.notifications.dispatcher.NotificationDispatcher",
@@ -1655,8 +1644,8 @@ class TestCheckDueRemindersNaiveLastNotifiedAt:
         monkeypatch,
     ):
         vin = test_vehicle["vin"]
-        # Overdue by hours target, but already notified 1 hour ago — well
-        # inside the 24h NOTIFICATION_COOLDOWN.
+        # Overdue by hours target, but already notified 1 hour ago, well
+        # inside the cooldown (`in_cooldown`).
         await _add_hours_record(db_session, vin, date.today(), Decimal("600.0"))
 
         reminder = Reminder(
@@ -1697,6 +1686,7 @@ class TestCheckDueRemindersNaiveLastNotifiedAt:
 
             async def dispatch(self, event_type, title, message):
                 sent_messages.append(message)
+                return {"ntfy": True}
 
         monkeypatch.setattr(
             "app.services.notifications.dispatcher.NotificationDispatcher",
@@ -1715,6 +1705,48 @@ class TestCheckDueRemindersNaiveLastNotifiedAt:
         # normalized and compared — a broken dedup (e.g. always False on
         # exception, or always True without normalization) would fail here.
         assert own_messages == []
+
+
+@pytest.mark.unit
+class TestTheOverdueCooldownAllowsSweepJitter:
+    """Fable F-2. The sweep runs once a day at 08:00 and captures `now` a few
+    hundred ms after the hour, so yesterday's stamp can read as just under 24 h
+    old. A heads-up the day before the due date then held back the first
+    overdue nag for a whole day."""
+
+    _SWEEP = datetime(2026, 10, 2, 8, 0, 0, 300_000, tzinfo=UTC)
+
+    @staticmethod
+    def _stamped(at: datetime) -> Reminder:
+        # Transient, so the due values don't clear the stamp (`_rearm_heads_up`).
+        # Naive, as the column holds it.
+        return Reminder(
+            vin="COOLDOWNJITTER",
+            title="Cooldown jitter",
+            reminder_type="date",
+            due_date=date(2026, 10, 1),
+            status="pending",
+            last_notified_at=at.replace(tzinfo=None),
+        )
+
+    def test_yesterdays_sweep_does_not_hold_back_todays_nag(self) -> None:
+        """Heads-up stamped at D 08:00:00.500, overdue at D+1 08:00:00.300."""
+        reminder = self._stamped(datetime(2026, 10, 1, 8, 0, 0, 500_000, tzinfo=UTC))
+        assert _due_event(reminder, "overdue", self._SWEEP) == "service_overdue"
+
+    def test_a_spring_forward_day_does_not_hold_back_todays_nag(self) -> None:
+        """Fable F-1. The sweep crons on local time: 08:00 CST on 2027-03-13,
+        then 08:00 CDT the next morning, 23 h later less the jitter."""
+        reminder = self._stamped(datetime(2027, 3, 13, 14, 0, 0, 500_000, tzinfo=UTC))
+        sweep = datetime(2027, 3, 14, 13, 0, 0, 300_000, tzinfo=UTC)
+        assert _due_event(reminder, "overdue", sweep) == "service_overdue"
+
+    @pytest.mark.parametrize("age", [timedelta(hours=2), timedelta(hours=21)])
+    def test_a_stamp_well_inside_the_day_still_holds_it_back(self, age: timedelta) -> None:
+        """Control, passes before the fix too: the slack covers jitter, not a
+        second nag the same day."""
+        reminder = self._stamped(self._SWEEP - age)
+        assert _due_event(reminder, "overdue", self._SWEEP) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1803,3 +1835,224 @@ class TestReminderSnooze:
 
         reminder = self._reminder(due_date=date(2020, 1, 1), snoozed_until=date(2026, 9, 20))
         assert is_reminder_overdue(reminder, None, None, today=date(2026, 9, 20)) is True
+
+
+# ---------------------------------------------------------------------------
+# A due-value change re-arms the heads-up (R1-H2)
+# ---------------------------------------------------------------------------
+
+# Naive, like the column.
+_TOLD = datetime(2026, 10, 1, 8, 0)
+
+
+@pytest_asyncio.fixture
+async def brake_vin(db_session: AsyncSession, test_user: dict[str, object]) -> AsyncIterator[str]:
+    """A vehicle of this test's own, for brake writes. Its rows cascade on delete."""
+    vin = f"RMREARM{uuid.uuid4().hex[:10].upper()}"
+    db_session.add(
+        Vehicle(vin=vin, user_id=test_user["id"], nickname="Rearm brakes", vehicle_type="Car")
+    )
+    await db_session.commit()
+    yield vin
+    await db_session.rollback()
+    await db_session.execute(delete(Vehicle).where(Vehicle.vin == vin))
+    await db_session.commit()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+class TestDueValueChangeRearmsTheHeadsUp:
+    """Whoever moves a due value clears `last_notified_at`, so the new target
+    gets its own heads-up. Main kept the stamp through every edit."""
+
+    async def _told(self, db: AsyncSession, vin: str, **fields: object) -> Reminder:
+        reminder = Reminder(
+            vin=vin, title="Rearm", status="pending", last_notified_at=_TOLD, **fields
+        )
+        db.add(reminder)
+        await db.commit()
+        await db.refresh(reminder)
+        return reminder
+
+    async def test_the_constructor_keeps_a_stamp_passed_before_the_due_values(
+        self, db_session: AsyncSession, test_vehicle: dict[str, object], clean_reminders: None
+    ):
+        """Control, passes on main. The stamp comes first in the kwargs, so a guard
+        that ran on a new object would clear it as the due date lands."""
+        reminder = Reminder(
+            vin=str(test_vehicle["vin"]),
+            last_notified_at=_TOLD,
+            title="Rearm constructor",
+            reminder_type="date",
+            due_date=date(2027, 1, 1),
+            status="pending",
+        )
+        assert reminder.last_notified_at == _TOLD
+        db_session.add(reminder)
+        await db_session.commit()
+        await db_session.refresh(reminder)
+        assert reminder.last_notified_at == _TOLD
+
+    async def test_a_put_moving_the_due_date_clears_it_and_a_title_edit_keeps_it(
+        self,
+        client: AsyncClient,
+        auth_headers: dict[str, str],
+        db_session: AsyncSession,
+        test_vehicle: dict[str, object],
+        clean_reminders: None,
+    ):
+        vin = str(test_vehicle["vin"])
+        reminder = await self._told(
+            db_session, vin, reminder_type="date", due_date=date(2027, 1, 1)
+        )
+        url = f"/api/vehicles/{vin}/reminders/{reminder.id}"
+
+        renamed = await client.put(url, headers=auth_headers, json={"title": "Rearm renamed"})
+        assert renamed.status_code == 200, renamed.text
+        await db_session.refresh(reminder)
+        assert reminder.last_notified_at == _TOLD
+
+        same = await client.put(url, headers=auth_headers, json={"due_date": "2027-01-01"})
+        assert same.status_code == 200, same.text
+        await db_session.refresh(reminder)
+        assert reminder.last_notified_at == _TOLD
+
+        moved = await client.put(url, headers=auth_headers, json={"due_date": "2027-02-01"})
+        assert moved.status_code == 200, moved.text
+        await db_session.refresh(reminder)
+        assert reminder.last_notified_at is None
+
+    async def test_set_thresholds_clears_it_on_a_change_and_keeps_it_on_a_no_op(
+        self, db_session: AsyncSession, test_vehicle: dict[str, object], clean_reminders: None
+    ):
+        from app.services.maintenance_recurrence import Thresholds
+        from app.services.maintenance_service import (
+            _set_thresholds,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        reminder = await self._told(
+            db_session,
+            str(test_vehicle["vin"]),
+            reminder_type="mileage",
+            due_mileage_km=Decimal("55000"),
+        )
+        same = Thresholds(
+            due_date=None, due_mileage_km=Decimal("55000"), due_hours=None, reminder_type="mileage"
+        )
+        assert _set_thresholds(reminder, same) is False
+        assert reminder.last_notified_at == _TOLD
+
+        moved = Thresholds(
+            due_date=None, due_mileage_km=Decimal("60000"), due_hours=None, reminder_type="mileage"
+        )
+        assert _set_thresholds(reminder, moved) is True
+        assert reminder.last_notified_at is None
+        await db_session.commit()
+        await db_session.refresh(reminder)
+        assert reminder.last_notified_at is None
+
+    async def test_a_scale_only_write_keeps_it(
+        self, db_session: AsyncSession, test_vehicle: dict[str, object], clean_reminders: None
+    ):
+        """Control, passes on main. 55000 and 55000.00 are the same target."""
+        reminder = await self._told(
+            db_session,
+            str(test_vehicle["vin"]),
+            reminder_type="mileage",
+            due_mileage_km=Decimal("55000"),
+        )
+        reminder.due_mileage_km = Decimal("55000.00")
+        assert reminder.last_notified_at == _TOLD
+
+    async def test_a_write_that_stores_the_same_number_keeps_it(
+        self, db_session: AsyncSession, test_vehicle: dict[str, object], clean_reminders: None
+    ):
+        """Fable F-4. 55000.004 rounds to the stored 55000.00, so the target
+        didn't move and the heads-up already went."""
+        reminder = await self._told(
+            db_session,
+            str(test_vehicle["vin"]),
+            reminder_type="mileage",
+            due_mileage_km=Decimal("55000"),
+        )
+        reminder.due_mileage_km = Decimal("55000.004")
+        assert reminder.last_notified_at == _TOLD
+
+    async def test_a_hundredth_of_a_km_still_clears_it(
+        self, db_session: AsyncSession, test_vehicle: dict[str, object], clean_reminders: None
+    ):
+        """Control: 55000.005 rounds up to 55000.01, a new target."""
+        reminder = await self._told(
+            db_session,
+            str(test_vehicle["vin"]),
+            reminder_type="mileage",
+            due_mileage_km=Decimal("55000"),
+        )
+        reminder.due_mileage_km = Decimal("55000.005")
+        assert reminder.last_notified_at is None
+
+    async def test_a_value_not_loaded_clears_it_without_loading(
+        self, db_session: AsyncSession, test_vehicle: dict[str, object], clean_reminders: None
+    ):
+        """An expired value can't be compared without a lazy load, which raises
+        under async. It clears: an extra heads-up beats a missed one."""
+        reminder = await self._told(
+            db_session, str(test_vehicle["vin"]), reminder_type="date", due_date=date(2027, 1, 1)
+        )
+        db_session.expire(reminder, ["due_date"])
+        reminder.due_date = date(2027, 1, 1)
+        assert reminder.last_notified_at is None
+
+    async def test_the_brake_sync_moving_the_due_date_clears_it(
+        self,
+        client: AsyncClient,
+        auth_headers: dict[str, str],
+        db_session: AsyncSession,
+        brake_vin: str,
+    ):
+        """The brake sync writes `due_date` in place (`brake_service`), not
+        through `update_reminder`."""
+        base = f"/api/vehicles/{brake_vin}/brakes/measurements"
+
+        async def _log(day: str, **corners: dict[str, str]) -> None:
+            response = await client.post(
+                base,
+                headers=auth_headers,
+                json={
+                    "recorded_at": day,
+                    "corners": [{"position": p, **figures} for p, figures in corners.items()],
+                },
+            )
+            assert response.status_code == 201, response.text
+
+        async def _front() -> Reminder:
+            db_session.expire_all()
+            return (
+                await db_session.execute(
+                    select(Reminder).where(
+                        Reminder.vin == brake_vin,
+                        Reminder.source == "low_brakes_front",
+                        Reminder.status == "pending",
+                    )
+                )
+            ).scalar_one()
+
+        await _log("2026-09-04", FL={"inner_pad_mm": "4"})
+        raised = await _front()
+        due = raised.due_date
+        await db_session.execute(
+            update(Reminder).where(Reminder.id == raised.id).values(last_notified_at=_TOLD)
+        )
+        await db_session.commit()
+
+        # A healthy figure on the other front corner: the sync runs, the date stays.
+        await _log("2026-09-04", FR={"inner_pad_mm": "9"})
+        kept = await _front()
+        assert (kept.id, kept.due_date, kept.last_notified_at) == (raised.id, due, _TOLD)
+
+        # A later, thinner FL figure moves the date.
+        await _log("2026-09-20", FL={"inner_pad_mm": "3.9"})
+        moved = await _front()
+        assert moved.id == raised.id
+        assert moved.due_date != due
+        assert moved.last_notified_at is None

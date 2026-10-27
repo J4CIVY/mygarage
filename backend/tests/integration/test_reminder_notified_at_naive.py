@@ -27,9 +27,29 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.reminder import Reminder
+from app.services.notifications.dispatcher import NotificationDispatcher
+
+
+@pytest.fixture
+def delivered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every notification reaches a provider.
+
+    The sweep stamps only a delivery, and the test database has no provider set
+    up, so the real `dispatch` returns `{}` and nothing would be stamped. Only
+    `dispatch` is replaced: the conditional stamp `UPDATE` is the real one, and
+    this file is its only PostgreSQL coverage.
+    """
+
+    async def _dispatch(
+        self: NotificationDispatcher, event_type: str, title: str, message: str, **_: object
+    ) -> dict[str, bool]:
+        return {"ntfy": True}
+
+    monkeypatch.setattr(NotificationDispatcher, "dispatch", _dispatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("delivered")
 class TestLastNotifiedAtIsWrittenNaive:
     async def test_a_due_reminder_can_be_marked_notified(
         self, db_session: AsyncSession, test_vehicle: dict[str, object]
@@ -97,7 +117,7 @@ class TestLastNotifiedAtIsWrittenNaive:
     async def test_now_is_still_aware_where_it_is_compared(self) -> None:
         """Pins the shape of the fix.
 
-        The column is naive; the comparison against `NOTIFICATION_COOLDOWN` is
+        The column is naive; the comparison in `in_cooldown` is
         aware. Both are true at once, and a fix that makes `now` naive
         everywhere would pass the first test and silently reintroduce the
         TypeError this module's read guard exists to prevent.
