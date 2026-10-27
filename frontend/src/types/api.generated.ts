@@ -16344,7 +16344,7 @@ export interface components {
             /**
              * At
              * Format: date-time
-             * @description Effective ledger date: purchase.date (midnight), a job usage's OWNING VISIT date, or a standalone adjustment's created_at (R1-H3 ordering)
+             * @description Effective ledger time on the household clock, with its offset: purchase.date (midnight), a job usage's OWNING VISIT date (midnight), or a standalone adjustment's created_at (R1-H3 ordering)
              */
             at: string;
             /**
@@ -16359,6 +16359,12 @@ export interface components {
             entry_type: "purchase" | "usage";
             /** Id */
             id: number;
+            /**
+             * Ledger Date
+             * Format: date
+             * @description The household calendar day the entry falls on (the date of `at`)
+             */
+            ledger_date: string;
             /**
              * Quantity
              * @description signed: + for purchase, − for usage
@@ -28865,7 +28871,7 @@ export interface operations {
     obc_suggestion_api_vehicles__vin__fuel_obc_suggestion_get: {
         parameters: {
             query: {
-                /** @description Fill-up timestamp (naive local). Returns the most recent DriveSession that ended on or before this time within a 24-hour window. */
+                /** @description Fill-up timestamp, naive in the household's zone (or with an offset). Returns the most recent DriveSession that ended on or before this time within a 24-hour window. */
                 at: string;
             };
             header?: never;

@@ -21,6 +21,8 @@ from reportlab.platypus import (
     TableStyle,
 )
 
+from app.config import settings
+from app.utils.household_time import household_zone
 from app.utils.pdf_styles import (
     ACCENT_AMBER,
     ACCENT_BAR_HEIGHT,
@@ -92,10 +94,11 @@ def draw_branded_header(
     canvas.setFont(body, 13)
     canvas.drawString(text_x, icon_y + icon_size - 38, subtitle)
 
-    # Date/time (right-aligned)
-    now = datetime.now()
+    # Date/time (right-aligned), in the household's zone with its real label.
+    # This used to be the container's clock with "CST" stuck on the end.
+    now = datetime.now(household_zone())
     date_str = now.strftime("%B %d, %Y")
-    time_str = now.strftime("%I:%M %p CST")
+    time_str = now.strftime("%I:%M %p %Z")
 
     x_right = PAGE_WIDTH - MARGIN
     canvas.setFillColor(TEXT_SECONDARY)
@@ -145,12 +148,13 @@ def draw_branded_footer(canvas: Any, doc: Any) -> None:  # pyright: ignore[repor
     canvas.setFillColor(TEXT_MUTED)
     canvas.drawString(x_left + text_w + bold_w, y + 5, " · homelabforge.io")
 
-    # Right: version + report ID
-    now = datetime.now()
+    # Right: version + report ID. Household time, like the header, so the two
+    # dates on the page agree.
+    now = datetime.now(household_zone())
     report_id = f"MG-{now.strftime('%Y%m%d-%H%M%S')}"
     canvas.setFont(mono, 11)
     canvas.setFillColor(TEXT_MUTED)
-    canvas.drawRightString(x_right, y + 5, f"v2.21 · {report_id}")
+    canvas.drawRightString(x_right, y + 5, f"v{settings.app_version} · {report_id}")
 
     canvas.restoreState()
 

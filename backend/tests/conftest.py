@@ -3,6 +3,7 @@
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 # Enable test mode BEFORE importing app (disables CSRF validation in middleware)
@@ -20,14 +21,14 @@ os.environ.setdefault("MYGARAGE_SETTINGS_KEY", "bXlnYXJhZ2UgdGVzdCBzZXR0aW5ncyBr
 if "TEST_DATABASE_URL" in os.environ:
     os.environ["MYGARAGE_DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Generator, Iterator
 from typing import NoReturn
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.pool import NullPool
 
 from app.config import settings
@@ -37,6 +38,7 @@ from app.models.fuel import FuelRecord
 from app.models.service_visit import ServiceVisit
 from app.models.user import User
 from app.models.vehicle import Vehicle
+from app.utils.pg_session import create_utc_async_engine
 from tests._shard import apply_shard
 
 
@@ -71,12 +73,13 @@ async def test_engine():
     """Create async engine for tests.
 
     Uses NullPool for PostgreSQL/asyncpg to avoid event loop binding issues
-    with starlette middleware sub-tasks in pytest.
+    with starlette middleware sub-tasks in pytest. PG sessions are pinned to
+    UTC like the app's, so a test reads what production would store.
     """
     pool_kwargs = {}
     if "asyncpg" in TEST_DATABASE_URL:
         pool_kwargs["poolclass"] = NullPool
-    engine = create_async_engine(TEST_DATABASE_URL, echo=False, **pool_kwargs)
+    engine = create_utc_async_engine(TEST_DATABASE_URL, echo=False, **pool_kwargs)
     if "sqlite" in TEST_DATABASE_URL:
         # Mirror production connection pragmas (WAL + foreign_keys=ON) so FK
         # cascade behavior in tests matches the deployed engine.
@@ -168,6 +171,22 @@ async def db_session(test_sessionmaker, init_test_db) -> AsyncGenerator[AsyncSes
     """Provide a database session for tests. Depends on init_test_db to ensure tables exist."""
     async with test_sessionmaker() as session:
         yield session
+
+
+@pytest.fixture
+def local_clock_off_utc() -> Iterator[None]:
+    """Put the process clock five hours west of UTC for one test.
+
+    A naive value fed to `astimezone` is read as LOCAL time, and a bare
+    `datetime.now()` is local too, so in a UTC container either bug looks right
+    and no test can tell. Its own MonkeyPatch, so undoing it can't undo the
+    test's other patches.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("TZ", "EST5")
+        time.tzset()
+        yield
+    time.tzset()
 
 
 @pytest_asyncio.fixture
