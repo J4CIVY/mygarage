@@ -8,6 +8,7 @@ import api from '../services/api'
 import { useUnitFormat } from '../hooks/useUnitFormat'
 import { useOdometerRecords, useDeleteOdometerRecord, useImportOdometerCSV } from '../hooks/queries/useOdometerRecords'
 import { getActionErrorMessage } from '../utils/httpErrorHandler'
+import { importToastDuration, listMessages } from '../utils/importSummary'
 import { Button, IconButton, Card, Mono, Badge, DataTable, EmptyState } from './ui'
 import type { DataTableColumn } from './ui'
 
@@ -97,14 +98,23 @@ export default function OdometerRecordList({ vin, onAddClick, onEditClick }: Odo
         if (result.error_count > 0) {
           parts.push(t('odometerRecordList.importErrored', { count: result.error_count }))
         }
-        const message = t('odometerRecordList.importCompleted', { summary: parts.join(', ') })
+        let message = t('odometerRecordList.importCompleted', { summary: parts.join(', ') })
+        // Errors then warnings, five of each at most. Backend strings go in
+        // verbatim, never routed through t().
+        const errors = result.errors ?? []
+        const warnings = result.warnings ?? []
+        if (errors.length > 0) {
+          message = `${message} - ${t('odometerRecordList.importErrorsLabel')}: ${listMessages(errors, t, ', ')}`
+        }
+        if (warnings.length > 0) {
+          message = `${message} - ${t('odometerRecordList.importWarningsLabel')}: ${listMessages(warnings, t, ', ')}`
+        }
 
-        if (result.errors && result.errors.length > 0) {
-          // Backend-supplied error strings are appended verbatim, never
-          // routed through t().
-          toast.error(`${message} - ${t('odometerRecordList.importErrorsLabel')}: ${result.errors.join(', ')}`)
+        const options = { duration: importToastDuration(errors, warnings) }
+        if (errors.length > 0) {
+          toast.error(message, options)
         } else {
-          toast.success(message)
+          toast.success(message, options)
         }
       },
       onError: (err) => {

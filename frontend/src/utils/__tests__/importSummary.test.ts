@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import i18next, { type TFunction } from 'i18next'
 import vehiclesEn from '../../locales/en/vehicles.json'
-import { buildImportSummary, type ImportSectionResult } from '../importSummary'
+import { buildImportSummary, listMessages, SECTIONS, type ImportSectionResult } from '../importSummary'
 
 // Echoes the key, plus the count when one is passed, so a count that never
 // reaches its line still fails.
@@ -99,5 +99,74 @@ describe('buildImportSummary', () => {
         '\nNotes: ✓ 4 imported' +
         '\nInsurance Policies: ✓ 1 imported, ✗ 1 error(s)',
     )
+  })
+})
+
+describe('buildImportSummary: the errors and warnings behind the counts (J2, N-3)', () => {
+  const SEVEN_ERRORS = ['e1', 'e2', 'e3', 'e4', 'e5', 'e6', 'e7']
+
+  it('lists the first five errors, how many more there are, then the warnings', () => {
+    const summary = buildImportSummary(
+      { ...FIVE_SECTIONS, errors: SEVEN_ERRORS, warnings: ['w1'] },
+      t,
+    )
+    // main: the counts only, so neither list is in the toast
+    expect(summary.endsWith(
+      '\n\nvehicles:detail.misc.importErrorsHeading' +
+        '\ne1\ne2\ne3\ne4\ne5' +
+        '\nvehicles:detail.misc.importMoreCount=2' +
+        '\n\nvehicles:detail.misc.importWarningsHeading' +
+        '\nw1',
+    )).toBe(true)
+  })
+
+  it('renders the lists and the new sections in English', async () => {
+    expect(
+      buildImportSummary(
+        {
+          service_records: bucket(1),
+          financing_records: bucket(2),
+          tax_records: bucket(1),
+          toll_tags: bucket(1),
+          toll_transactions: bucket(3, 1),
+          warranties: bucket(1),
+          spot_rentals: bucket(0, 0, 1),
+          errors: SEVEN_ERRORS,
+          warnings: ['Toll transaction 0: its toll tag was not imported, saved without one'],
+        },
+        await english(),
+      ),
+    ).toBe(
+      'Import completed:\n' +
+        '\nService Records: ✓ 1 imported' +
+        '\nFinancing: ✓ 2 imported' +
+        '\nTax & Registration Records: ✓ 1 imported' +
+        '\nToll Tags: ✓ 1 imported' +
+        '\nToll Transactions: ✓ 3 imported, ○ 1 skipped' +
+        '\nWarranties: ✓ 1 imported' +
+        '\nSpot Rentals: ✓ 0 imported, ✗ 1 error(s)' +
+        '\n\nErrors:\ne1\ne2\ne3\ne4\ne5\n+2 more' +
+        '\n\nWarnings:\nToll transaction 0: its toll tag was not imported, saved without one',
+    )
+  })
+})
+
+describe('importSummary: the section table and the CSV toast lists', () => {
+  // t(label) takes a variable, so the i18n usage gate can't see these keys.
+  // This walks the table instead: a row whose key isn't in the bundle fails here.
+  it('every section label resolves to its English title', async () => {
+    const en = await english()
+    for (const [, label] of SECTIONS) {
+      const path = label.replace(/^vehicles:/, '').split('.')
+      const value = path.reduce<unknown>((node, part) => (node as Record<string, unknown> | undefined)?.[part], vehiclesEn)
+      expect(typeof value, label).toBe('string')
+      expect(en(label)).toBe(value)
+    }
+  })
+
+  it('a comma-joined list keeps the first five, then says how many more', async () => {
+    const seven = ['w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7']
+    expect(listMessages(seven, await english(), ', ')).toBe('w1, w2, w3, w4, w5, +2 more')
+    expect(listMessages(seven.slice(0, 5), await english(), ', ')).toBe('w1, w2, w3, w4, w5')
   })
 })

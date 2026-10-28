@@ -21,6 +21,7 @@ import { priceToDisplay } from '../utils/decimalSafe'
 import { getUsageTracking } from '../utils/usageTracking'
 import { useFuelRecords, useDeleteFuelRecord, useImportFuelCSV } from '../hooks/queries/useFuelRecords'
 import { getActionErrorMessage } from '../utils/httpErrorHandler'
+import { importToastDuration, listMessages } from '../utils/importSummary'
 import { Button, IconButton, Card, Mono, DataTable, Badge, SearchField, EmptyState, Checkbox, Select } from './ui'
 import type { DataTableColumn } from './ui'
 import FuelImportOptionsDrawer, { type FuelImportOptions } from './FuelImportOptionsDrawer'
@@ -190,16 +191,26 @@ export default function FuelRecordList({ vin, onAddClick, onEditClick }: FuelRec
       { formData, format: importFormat },
       {
         onSuccess: (result) => {
-          const message = t('fuelList.importCompleted', {
+          const summary = t('fuelList.importCompleted', {
             success: result.success_count,
             skipped: result.skipped_count,
             errors: result.error_count,
           })
+          // Errors then warnings, five of each at most: a moved history warns on every row.
+          const errors = result.errors ?? []
+          const warnings = result.warnings ?? []
+          const withErrors =
+            errors.length > 0 ? t('fuelList.importErrors', { message: summary, errors: listMessages(errors, t, ', ') }) : summary
+          const message =
+            warnings.length > 0
+              ? t('fuelList.importWarnings', { message: withErrors, warnings: listMessages(warnings, t, ', ') })
+              : withErrors
 
-          if (result.errors && result.errors.length > 0) {
-            toast.error(t('fuelList.importErrors', { message, errors: result.errors.join(', ') }))
+          const options = { duration: importToastDuration(errors, warnings) }
+          if (errors.length > 0) {
+            toast.error(message, options)
           } else {
-            toast.success(message)
+            toast.success(message, options)
           }
         },
         onError: (err) => {

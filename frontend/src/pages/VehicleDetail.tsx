@@ -89,7 +89,7 @@ import { VehicleUnitScope } from '../contexts/VehicleUnitScope'
 import { forgetCachedVehicle, readCachedVehicle, rememberVehicle } from '../utils/vehicleCache'
 import { useSyncQuickEntryVehicle } from '../hooks/queries/useQuickEntryVehicles'
 import { useVehicleDetailStats } from '../hooks/queries/useVehicleDetailStats'
-import { buildImportSummary } from '../utils/importSummary'
+import { buildImportSummary, hasRowErrors, importToastDuration, type ImportJsonResult } from '../utils/importSummary'
 
 export type ModalType = 'remove' | 'transfer' | 'sharing' | 'windowSticker' | 'torqueSource' | null
 export type PrimaryTabType = 'overview' | 'media' | 'maintenance' | 'fuel' | 'tracking' | 'financial' | 'livelink'
@@ -353,13 +353,21 @@ export default function VehicleDetail() {
       const formData = new FormData()
       formData.append('file', file)
 
-      const response = await api.post(`/import/vehicles/${vin}/json`, formData, {
+      const response = await api.post<ImportJsonResult>(`/import/vehicles/${vin}/json`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
       })
-      toast.success(t('detail.importSuccess'), {
-        description: buildImportSummary(response.data, t)
+      const result = response.data
+      // A refused row isn't a clean success, so it doesn't get the green toast.
+      const rowErrors = hasRowErrors(result)
+      const notify = rowErrors ? toast.warning : toast.success
+      // Two plain t() calls: the i18n gate only reads a literal key.
+      const title = rowErrors ? t('detail.importWithErrors') : t('detail.importSuccess')
+      notify(title, {
+        description: buildImportSummary(result, t),
+        // Lists of errors and warnings take longer to read than sonner's 4s.
+        duration: importToastDuration(result.errors, result.warnings),
       })
 
       // Reload the vehicle data

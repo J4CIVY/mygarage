@@ -6,11 +6,12 @@ import type { OdometerRecord } from '../../types/odometer'
 
 const useOdometerRecordsMock = vi.fn()
 const deleteMutate = vi.fn()
+const importMutate = vi.fn()
 
 vi.mock('../../hooks/queries/useOdometerRecords', () => ({
   useOdometerRecords: () => useOdometerRecordsMock(),
   useDeleteOdometerRecord: () => ({ mutate: deleteMutate, isPending: false, variables: undefined }),
-  useImportOdometerCSV: () => ({ mutate: vi.fn(), isPending: false }),
+  useImportOdometerCSV: () => ({ mutate: importMutate, isPending: false }),
 }))
 vi.mock('../../services/api', () => ({ default: { get: vi.fn() } }))
 vi.mock('../../hooks/useUnitPreference', () => ({
@@ -24,6 +25,7 @@ vi.mock('../../hooks/useUnitPreference', () => ({
   }),
 }))
 vi.mock('sonner', () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
+import { toast } from 'sonner'
 
 import OdometerRecordList from '../OdometerRecordList'
 
@@ -109,5 +111,61 @@ describe('OdometerRecordList — row actions + empty state', () => {
     expect(screen.getByText('odometerList.noRecords')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'odometerList.addFirstReading' }))
     expect(onAddClick).toHaveBeenCalled()
+  })
+})
+
+describe('OdometerRecordList: the CSV import toast', () => {
+  it('a clean import toast keeps the default duration (control: passes on c304a690)', () => {
+    importMutate.mockImplementation((_form: FormData, options: { onSuccess: (r: unknown) => void }) =>
+      options.onSuccess({ success_count: 1, skipped_count: 0, error_count: 0, errors: [], warnings: [] }),
+    )
+    const { container } = render(<OdometerRecordList {...PROPS} />)
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]')!
+    fireEvent.change(input, { target: { files: [new File(['Date\n'], 'odometer.csv')] } })
+    expect(toast.success).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(toast.success).mock.calls[0][1]?.duration).toBeUndefined()
+  })
+
+  it('appends the warnings to the summary (J2)', () => {
+    importMutate.mockImplementation((_form: FormData, options: { onSuccess: (r: unknown) => void }) =>
+      options.onSuccess({
+        success_count: 1,
+        skipped_count: 0,
+        error_count: 0,
+        errors: [],
+        warnings: ['Row 2: kept as text'],
+      }),
+    )
+    const { container } = render(<OdometerRecordList {...PROPS} />)
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]')!
+    fireEvent.change(input, { target: { files: [new File(['Date\n'], 'odometer.csv')] } })
+    // main: 'odometerRecordList.importCompleted', the warning dropped
+    // c304a690: no options, so sonner's 4s for a list
+    expect(toast.success).toHaveBeenCalledWith(
+      'odometerRecordList.importCompleted - odometerRecordList.importWarningsLabel: Row 2: kept as text',
+      { duration: 10_000 },
+    )
+  })
+
+  it('caps each list at five plus a more-count, errors before warnings', () => {
+    importMutate.mockImplementation((_form: FormData, options: { onSuccess: (r: unknown) => void }) =>
+      options.onSuccess({
+        success_count: 7,
+        skipped_count: 0,
+        error_count: 1,
+        errors: ['Row 9: bad date'],
+        warnings: ['w1', 'w2', 'w3', 'w4', 'w5', 'w6', 'w7'],
+      }),
+    )
+    const { container } = render(<OdometerRecordList {...PROPS} />)
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]')!
+    fireEvent.change(input, { target: { files: [new File(['Date\n'], 'odometer.csv')] } })
+    // Before: warnings first, and all seven of them.
+    expect(toast.error).toHaveBeenCalledWith(
+      'odometerRecordList.importCompleted' +
+        ' - odometerRecordList.importErrorsLabel: Row 9: bad date' +
+        ' - odometerRecordList.importWarningsLabel: w1, w2, w3, w4, w5, vehicles:detail.misc.importMoreCount',
+      { duration: 10_000 },
+    )
   })
 })
